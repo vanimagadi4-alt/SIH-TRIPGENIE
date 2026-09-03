@@ -275,7 +275,7 @@ async function handleSendMoney(e) {
 
   let newTxn;
   try {
-    const response = await fetch('/api/wallet/pay', {
+    const response = await fetch('http://' + window.location.hostname + ':8000/api/wallet/pay', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount, recipient, category: 'UPI Transfer', note })

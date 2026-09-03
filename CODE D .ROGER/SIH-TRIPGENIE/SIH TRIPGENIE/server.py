@@ -21,6 +21,8 @@ import os
 import sys
 import json
 import sqlite3
+import hashlib
+import secrets
 import urllib.parse
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
@@ -96,6 +98,27 @@ def load_database():
     os.makedirs(DATA_DIR, exist_ok=True)
     with sqlite3.connect(DB_FILE) as connection:
         connection.execute('CREATE TABLE IF NOT EXISTS app_state (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL)')
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS users ('
+            ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            ' name TEXT NOT NULL,'
+            ' email TEXT NOT NULL UNIQUE,'
+            ' phone TEXT,'
+            ' password_hash TEXT NOT NULL,'
+            ' salt TEXT NOT NULL,'
+            ' role TEXT NOT NULL DEFAULT "TOURIST",'
+            ' account_status TEXT NOT NULL DEFAULT "ACTIVE",'
+            ' created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP'
+            ')'
+        )
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS sessions ('
+            ' token TEXT PRIMARY KEY,'
+            ' user_id INTEGER NOT NULL,'
+            ' created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,'
+            ' FOREIGN KEY (user_id) REFERENCES users(id)'
+            ')'
+        )
         row = connection.execute('SELECT payload FROM app_state WHERE id = 1').fetchone()
         if row:
             try:
@@ -104,6 +127,45 @@ def load_database():
             except (TypeError, json.JSONDecodeError):
                 pass
         save_database(connection)
+
+
+def hash_password(password, salt=None):
+    """Return (salt, hex_digest) using PBKDF2-HMAC-SHA256 with a per-user salt."""
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000)
+    return salt, digest.hex()
+
+
+def verify_password(password, salt, expected_digest):
+    """Constant-time comparison of a password against a stored PBKDF2 digest."""
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000)
+    return secrets.compare_digest(digest.hex(), expected_digest)
+
+
+def find_user_by_email(email):
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute('SELECT * FROM users WHERE lower(email) = lower(?)', (email,)).fetchone()
+        return dict(row) if row else None
+
+
+def create_session(user_id):
+    token = secrets.token_hex(24)
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute('INSERT INTO sessions (token, user_id) VALUES (?, ?)', (token, user_id))
+        connection.commit()
+    return token
+
+
+def public_user(user):
+    """Strip sensitive fields before returning to the client."""
+    return {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "phone": user.get("phone"),
+        "role": user.get("role", "TOURIST")
+    }
 
 
 def save_database(connection=None):
@@ -286,6 +348,79 @@ class TripGenieRequestHandler(SimpleHTTPRequestHandler):
 
             self._set_json_headers(200)
             self.wfile.write(json.dumps({"success": True, "reply": response_text}).encode())
+            return
+
+        # 5. User Registration Endpoint
+        elif path == '/api/auth/register':
+            name = (body_data.get('name') or '').strip()
+            email = (body_data.get('email') or '').strip().lower()
+            phone = (body_data.get('phone') or '').strip()
+            password = body_data.get('password') or ''
+
+            if not name:
+                self._set_json_headers(400)
+                self.wfile.write(json.dumps({"success": False, "error": "Full name is required"}).encode())
+                return
+            if not email or '@' not in email or '.' not in email:
+                self._set_json_headers(400)
+                self.wfile.write(json.dumps({"success": False, "error": "A valid email is required"}).encode())
+                return
+            if len(password) < 6:
+                self._set_json_headers(400)
+                self.wfile.write(json.dumps({"success": False, "error": "Password must contain at least 6 characters"}).encode())
+                return
+            if find_user_by_email(email):
+                self._set_json_headers(409)
+                self.wfile.write(json.dumps({"success": False, "error": "An account with this email already exists"}).encode())
+                return
+
+            salt, pwd_hash = hash_password(password)
+            with sqlite3.connect(DB_FILE) as connection:
+                cursor = connection.execute(
+                    'INSERT INTO users (name, email, phone, password_hash, salt) VALUES (?, ?, ?, ?, ?)',
+                    (name, email, phone, pwd_hash, salt)
+                )
+                connection.commit()
+                user_id = cursor.lastrowid
+            user = public_user({"id": user_id, "name": name, "email": email, "phone": phone, "role": "TOURIST"})
+            token = create_session(user_id)
+
+            self._set_json_headers(201)
+            self.wfile.write(json.dumps({"success": True, "message": "Registration successful", "token": token, "user": user}).encode())
+            return
+
+        # 6. User Login Endpoint
+        elif path == '/api/auth/login':
+            email = (body_data.get('email') or '').strip().lower()
+            password = body_data.get('password') or ''
+
+            user = find_user_by_email(email) if email else None
+            if not user or not verify_password(password, user['salt'], user['password_hash']):
+                self._set_json_headers(401)
+                self.wfile.write(json.dumps({"success": False, "error": "Invalid email or password"}).encode())
+                return
+            if user.get('account_status', 'ACTIVE') != 'ACTIVE':
+                self._set_json_headers(403)
+                self.wfile.write(json.dumps({"success": False, "error": "This account is suspended"}).encode())
+                return
+
+            token = create_session(user['id'])
+            self._set_json_headers(200)
+            self.wfile.write(json.dumps({"success": True, "message": "Login successful", "token": token, "user": public_user(user)}).encode())
+            return
+
+        # 7. User Logout Endpoint
+        elif path == '/api/auth/logout':
+            token = None
+            auth_header = self.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:].strip()
+            if token:
+                with sqlite3.connect(DB_FILE) as connection:
+                    connection.execute('DELETE FROM sessions WHERE token = ?', (token,))
+                    connection.commit()
+            self._set_json_headers(200)
+            self.wfile.write(json.dumps({"success": True, "message": "Logged out successfully"}).encode())
             return
 
         self._set_json_headers(404)

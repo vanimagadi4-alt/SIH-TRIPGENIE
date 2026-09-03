@@ -210,12 +210,15 @@ h1, h2, h3, h4, h5, h6 {
 .brand-logo-icon {
   width: 42px;
   height: 42px;
-  background: var(--grad-primary);
+  background: url('../assets/tripgenie-logo.svg') center/cover no-repeat;
   border-radius: var(--radius-md);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
+  color: transparent;
+  font-size: 0;
+  line-height: 0;
+  overflow: hidden;
   box-shadow: 0 4px 15px rgba(124, 58, 237, 0.35);
   transition: transform var(--transition-fast);
 }
